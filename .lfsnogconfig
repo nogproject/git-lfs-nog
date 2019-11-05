@@ -1,0 +1,9 @@
+[nogremote]
+	name = sprohaska/zibtools
+	name = marcosterland/zibtools
+	name = ulrikehomberg/zibtools
+	name = nlindow/vissys-stdtools-zibtools
+	name = schallau/zibtools
+	name = vincentdercksen/zibtools
+[lfsnog]
+	maxtextsize = 100000

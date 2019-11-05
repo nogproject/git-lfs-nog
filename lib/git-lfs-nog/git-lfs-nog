@@ -1,0 +1,1167 @@
+#!/usr/bin/env python3
+
+"""\
+Usage:
+  git-lfs-nog clone <git-repo> [<dir>] [--] [<git-options>...]
+  git-lfs-nog init [--track=<what>] [--force-hooks] [--force-attrs]
+  git-lfs-nog remote [-f] [--force-config] <nog-repo>
+  git-lfs-nog fetch [-v] [<nog-repo>] [--] <files>...
+  git-lfs-nog push [-f] [--git] [--lfs-only|--lfs-and-text] \
+[<nog-repo>] [--] [<git-args>...]
+
+Options:
+  --track=<what>
+        Controls which files will be configured for LFS tracking: `none`,
+        `common`, `most`, `convert`.  See details below.
+
+  -v --verbose  Print more information.
+  -f --force    Disable some safety checks.
+
+  --force-config    Force creating `.lfsnogconfig`.
+
+Git LFS Nog manages Git LFS content in Nog.  It assumes that the corresponding
+Git and Nog repos have the same name, for example:
+
+ - Git repo: git@git.zib.de:jdoe/myawesomeproject.git
+ - Nog repo: https://nog.zib.de/johndoe/myawesomeproject
+
+`git-lfs-nog clone` clones `<git-repo>` and fetches Git LFS content from Nog if
+one or more `nogremote.name` fields are configured in `.lfsnogconfig`.
+Additional options after `--` are passed to `git clone`.
+
+`git-lfs-nog init` configures the local working copy to store track content
+with Git LFS and push it to Nog.  It sets LFS tracking rules in
+`.gitattributes` and configures Git hooks.  `init` refuses to modify existing
+files unless `--force-hooks` or `--force-attrs` is used.
+If no tracking rules are specified, the existing rules will be used.
+
+`--track=<what>` controls which files types to track in Git LFS.  `none`
+creates an empty `.gitattributes`.  `common` configures Git LFS for common
+binary file types.  `most` configures Git LFS to track all files except for
+Markdown and dot files.  `convert` modifies an existing `.gitattributes` and
+configures git-silo trackings into LFS trackings.  Modify `.gitattributes` to
+manually control tracking:
+
+```
+ # Explicitly tack .dat files:
+*.dat filter=lfs diff=lfs merge=lfs -text
+ # Explicitly do not track .md files:
+*.md -filter text
+```
+
+`git-lfs-nog remote` adds `<nog-repo>` to `.lfsnogconfig` and creates a Nog repo
+for the current Nog user.  The owner must be specified in `<nog-repo>` as a
+safety measure.  If `<nog-repo>` already exists, `-f` is required to confirm
+that it will be configured as a Nog remote.  The `.lfsnogconfig` format is:
+
+```
+[nogremote]
+    name = <ownername>/<reponame>
+    name = ...
+```
+
+`git-lfs-nog fetch` fetches Git LFS content from Nog.  The Nog repo can be
+explicitly specified, or the default repos from `.lfsnogconfig` are used.  The
+paths to be considered are specified as in `git ls-files <files>...`.  There
+are no default paths to avoid accidentally fetching all content in large repos.
+Use `git lfs-nog fetch -- .` to explicitly fetch all content.
+
+`git-lfs-nog push` pushes Git LFS content to a Nog repo of the current user,
+assuming the user's Nog environment is configured.  The files are only pushed
+to Nog repos that are listed in the config file.  If `<nog-repo>` is not
+specified and only a single repo is configured, the files will be pushed to
+that repo.  With `--git`, `git push <git-args>` will be called after pushing
+the Git LFS content.
+
+Push supports upload strategies that can be configured in `.lfsnogconfig` or via
+command line arguments:
+
+ - `lfsnog.upload=asbefore`: Use the same strategy that has been used before
+   for the target Nog repo.  Use `lfsonly` for the first upload.
+ - `lfsnog.upload=lfsonly`, `--lfs-only`: Upload only LFS content.
+ - `lfsnog.upload=lfsandtext`, `--lfs-and-text`: Upload LFS content as Nog
+   blobs and other Git content as Nog text.  Git content must be UTF-8-encoded
+   text.  The maximum text size can be configured in `lfsnog.maxtextsize`
+   (default: 100000, hard limit 190000).
+
+The default upload strategy is `asbefore`.  It allows each Nog remote to use a
+different strategy.  To switch a Nog remote to `lfsandtext`, push once with
+`git lfs-nog push --lfs-and-text`.
+
+Consider starting with an explicit, smaller text size limit and increase it
+only after considering alternatives, such as splitting files.  Example:
+
+```
+git config -f .lfsnogconfig lfsnog.maxtextsize 80000
+```
+
+Previously saved `git-lfs-nog` configuration in the Git-LFS-owned file
+`.lfsconfig` should be moved to `.lfsnogconfig` to prevent Git LFS from warning
+about 'unsafe lfsconfig keys':
+
+ - create `.lfsnogconfig`,
+ - copy `nog` entries from `.lfsconfig` into `.lfsnogconfig`,
+ - remove `nog` from `.lfsconfig`.
+
+"""
+
+from docopt import docopt
+from os import chdir, readlink
+from os.path import dirname, basename, splitext, exists, isdir, islink
+from os.path import join as pjoin
+from subprocess import check_output, check_call, CalledProcessError
+from subprocess import call, DEVNULL
+import attr
+import nog
+import os
+import sys
+
+LFS_CONFIG = '.lfsconfig'
+LFS_CONFIG_PATH = '.lfsnogconfig'
+os.environ['GIT_LFS_NOG'] = 'git-lfs-nog'
+
+# `U_*` are the upload strategies.
+U_AS_BEFORE = 'asbefore'  # Same as used before for the target repo.
+U_LFS_ONLY = 'lfsonly'  # Only LFS content.
+U_LFS_AND_TEXT = 'lfsandtext'  # LFS content as blob, Git content as text.
+
+
+@attr.s()
+class Settings(object):
+    upload = attr.ib(default=U_AS_BEFORE)
+    maxTextSize = attr.ib(default=100000)
+
+    def loadConfig(self):
+
+        p = pjoin(gitToplevel(), LFS_CONFIG)
+        if exists(p) and gitConfigKeyExists(p, 'nog'):
+            global LFS_CONFIG_PATH
+            LFS_CONFIG_PATH = LFS_CONFIG
+            msg = ("""Git LFS 2.3.0 or later will warn unsafe lfsconfig keys in
+its config file.  To avoid these warnings:
+    1. create `.lfsnogconfig`,
+    2. copy all `*nog*` entries from `.lfsconfig` into `.lfsnogconfig` and
+    3. remove them from `.lfsconfig`.
+
+Now using LFS owned config file `{path}`.
+            """)
+            log(msg.format(path=LFS_CONFIG_PATH))
+
+        p = pjoin(gitToplevel(), LFS_CONFIG_PATH)
+        if not exists(p):
+            return
+
+        k = 'lfsnog.upload'
+        v = gitConfigGet('-f', p, k)
+        if v:
+            upl = v.lower()
+            if upl not in [U_AS_BEFORE, U_LFS_ONLY, U_LFS_AND_TEXT]:
+                msg = 'Invalid value `{k}={v}` in `{p}`.'
+                die(msg.format(k=k, v=v, p=p))
+            self.upload = upl
+
+        k = 'lfsnog.maxtextsize'
+        v = gitConfigGet('-f', p, k)
+        if v is not None:
+            try:
+                limit = int(v)
+            except ValueError:
+                msg = 'Cannot convert `{k}={v}` to int in `{p}`.'
+                die(msg.format(k=k, v=v, p=p))
+
+            if limit < 1:
+                msg = 'Limit `{k}={v}` to small in `{p}`.'
+                die(msg.format(k=k, v=v, p=p))
+
+            # `limit` must be smaller than the default
+            # `nog.POST_BUFFER_SIZE_LIMIT`, which is 200000 since
+            # `nogpy-0.0.18`.
+            hardLimit = 190000
+            if limit > hardLimit:
+                msg = 'Limit `{k}={v}` greater than {hardLimit} in `{p}`.'
+                die(msg.format(k=k, v=v, p=p, hardLimit=hardLimit))
+
+            self.maxTextSize = limit
+
+    def parseArgs(self, args):
+        if args['--lfs-only']:
+            self.upload = U_LFS_ONLY
+        if args['--lfs-and-text']:
+            self.upload = U_LFS_AND_TEXT
+
+
+LFS_PRE_PUSH_HOOK = r"""#!/bin/bash
+set -o errexit -o pipefail -o nounset -o noglob
+
+# Any value in `GIT_LFS_NOG` silences the hook.
+if [ -n "${GIT_LFS_NOG:-}" ]; then
+    exit 0
+fi
+
+lfsChangesSince() {
+    local base="$1"
+    git diff --name-only "${base}" HEAD \
+    | git check-attr --stdin filter \
+    | grep 'filter: lfs$'
+}
+
+if upstream=$(git rev-parse --verify --symbolic-full-name '@{u}' 2>/dev/null) \
+    && lfsChangesSince "${upstream}";
+then
+        cat <<EOF
+
+lfs-nog: The current branch contains LFS content changes relative to the
+upstream branch \`${upstream}\`.  See list above.
+
+But you are about to push only the Git branch.  Others will not be able to
+fetch the LFS content unless you have already pushed it before.  To push the
+LFS content to Nog and the branch to Git, run:
+
+    git-lfs-nog push --git [<nog-repo-name>]
+
+If you indeed mean to push only to Git, run:
+
+    git push --no-verify
+
+EOF
+    exit 1
+fi
+"""
+
+LFS_DEFAULT_PRE_PUSH_HOOK = '''#!/bin/sh
+command -v git-lfs >/dev/null 2>&1 || { echo >&2 "\\nThis repository is \
+configured for Git LFS but 'git-lfs' was not found on your path. \
+If you no longer wish to use Git LFS, remove this hook by deleting \
+.git/hooks/pre-push.\\n"; exit 2; }
+git lfs pre-push "$@"
+'''
+
+GIT_ATTRIBUTES_PATH = '.gitattributes'
+
+GIT_ATTRIBUTES = {
+    'none': '',
+
+    'most': r"""
+* filter=lfs diff=lfs merge=lfs -text
+*.md -filter !diff !merge text
+.* -filter !diff !merge text
+""",
+
+    'common': r"""
+**/*.key/** filter=lfs diff=lfs merge=lfs -text
+**/*.oo3/** filter=lfs diff=lfs merge=lfs -text
+**/*.sparsebundle/** filter=lfs diff=lfs merge=lfs -text
+*.AVI filter=lfs diff=lfs merge=lfs -text
+*.TIF filter=lfs diff=lfs merge=lfs -text
+*.am filter=lfs diff=lfs merge=lfs -text
+*.avi filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.csv filter=lfs diff=lfs merge=lfs -text
+*.dat filter=lfs diff=lfs merge=lfs -text
+*.doc filter=lfs diff=lfs merge=lfs -text
+*.docx filter=lfs diff=lfs merge=lfs -text
+*.eps filter=lfs diff=lfs merge=lfs -text
+*.gif filter=lfs diff=lfs merge=lfs -text
+*.icol filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.key filter=lfs diff=lfs merge=lfs -text
+*.m4v filter=lfs diff=lfs merge=lfs -text
+*.mod filter=lfs diff=lfs merge=lfs -text
+*.mov filter=lfs diff=lfs merge=lfs -text
+*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.mpg filter=lfs diff=lfs merge=lfs -text
+*.odg filter=lfs diff=lfs merge=lfs -text
+*.oo3 filter=lfs diff=lfs merge=lfs -text
+*.pdf filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+*.ppt filter=lfs diff=lfs merge=lfs -text
+*.pptm filter=lfs diff=lfs merge=lfs -text
+*.pptx filter=lfs diff=lfs merge=lfs -text
+*.raw filter=lfs diff=lfs merge=lfs -text
+*.rec filter=lfs diff=lfs merge=lfs -text
+*.surf filter=lfs diff=lfs merge=lfs -text
+*.tar filter=lfs diff=lfs merge=lfs -text
+*.tar.bz2 filter=lfs diff=lfs merge=lfs -text
+*.tar.gz filter=lfs diff=lfs merge=lfs -text
+*.tar.xz filter=lfs diff=lfs merge=lfs -text
+*.tif filter=lfs diff=lfs merge=lfs -text
+*.tiff filter=lfs diff=lfs merge=lfs -text
+*.xls filter=lfs diff=lfs merge=lfs -text
+*.xlsx filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+""",
+}
+
+
+def main():
+    args = docopt(__doc__)
+    settings = Settings()
+    settings.loadConfig()
+    settings.parseArgs(args)
+    if args['clone']:
+        cmdClone(args)
+    elif args['init']:
+        cmdInit(args)
+    elif args['remote']:
+        cmdRemote(args)
+    elif args['fetch']:
+        cmdFetch(args)
+    elif args['push']:
+        cmdPush(args, settings)
+
+
+def cmdClone(args):
+    checkNogEnv()
+    gitRepo = args['<git-repo>']
+    opts = args['<git-options>']
+    folder = args['<dir>']
+    if folder == '--':
+        folder = None
+    if not folder:
+        folder, _ = splitext(basename(gitRepo))
+
+    cmd = [
+        'git',
+        '-c', 'filter.lfs.smudge=git-lfs smudge --skip -- %f',
+        '-c', 'filter.lfs.process=git-lfs filter-process --skip',
+        'clone',
+    ] + opts + [
+        '--', gitRepo, folder,
+    ]
+    try:
+        check_call(cmd)
+    except:
+        die('git clone failed.')
+
+    chdir(folder)
+    setLfsHooks()
+    skipLfsFetch()
+
+    if not exists(LFS_CONFIG_PATH):
+        msg = 'Skipped Git LFS fetch: missing config file `{}`.'
+        log(msg.format(LFS_CONFIG_PATH))
+        exit(0)
+
+    nogRepos = readNogRemotesFromConfig()
+    if len(nogRepos) == 0:
+        msg = 'Skipped Git LFS fetch: no nog remotes in `{}`.'
+        log(msg.format(LFS_CONFIG_PATH))
+        exit(0)
+
+    fetchFromNogRepo(nogRepos, files=lsLfs())
+
+
+def writeGitAttributes(content):
+    with open(GIT_ATTRIBUTES_PATH, 'w') as f:
+        f.write(content)
+    log('Configured LFS tracking rules.')
+
+
+# `mayOverwrite()` return true if the path may be safely modified.  A path may
+# be modified if it does not exist or if its content matches any of the strings
+# in `accept`.  `accept` can be a string or a list of strings.
+def mayOverwrite(path, accept):
+    if not exists(path):
+        return True
+
+    if not isinstance(accept, list):
+        accept = [accept]
+    actual = readFile(path)
+    for a in accept:
+        if actual == a:
+            return True
+    return False
+
+
+def hasGitAttributes():
+    return exists(pjoin(gitToplevel(), GIT_ATTRIBUTES_PATH))
+
+
+def siloToLFS():
+    ga = readFile(GIT_ATTRIBUTES_PATH)
+    return ga.replace("filter=silo", "filter=lfs diff=lfs merge=lfs")
+
+
+def hasGitAttributesInSubdirs():
+    gaisd = list(filter(lambda x: x.endswith("/.gitattributes"), gitLsFiles()))
+    return len(gaisd) != 0
+
+
+def hasGitSiloPlaceholder():
+    silostatus = gitSplitlines('silo', 'status')
+    silostatus = list(map(lambda x: x.split()[0], silostatus))
+    return "placeholder" in silostatus
+
+
+def cmdInit(args):
+    chdir(gitToplevel())
+    dirty = gitStatus()
+    if dirty:
+        die('Uncommitted changes; commit everything before you continue.')
+
+    if hasGitAttributesInSubdirs():
+        die("There are one or more .gitattributes in subdirectories.")
+
+    optTrack = args['--track']
+    skip_attrs = optTrack is None
+    if skip_attrs:
+        log('No attributes specified, using existing.')
+        if not hasGitAttributes():
+            die('No attributes specified and no existing attributes found.')
+    if not skip_attrs:
+        if optTrack == 'convert':
+            if not hasGitAttributes:
+                die("No .gitattributes found.")
+            if hasGitSiloPlaceholder():
+                die("""\
+Found silo placeholders.  Fetch all silo data before converting to LFS:
+
+    git silo fetch -- .
+    git silo status
+""")
+            gitAttrs = siloToLFS()
+        else:
+            try:
+                gitAttrs = GIT_ATTRIBUTES[optTrack]
+            except KeyError:
+                die("Unknown --track argument.")
+        gitAttrs = gitAttrs.strip() + '\n'
+
+    force_hooks = args['--force-hooks']
+    force_attrs = args['--force-attrs']
+    if not force_hooks:
+        pathPrePushHook = gitPathPrePushHook()
+        accept = [LFS_PRE_PUSH_HOOK, LFS_DEFAULT_PRE_PUSH_HOOK]
+        if not mayOverwrite(pathPrePushHook, accept):
+            msg = 'Would modify `{}`.  Use `--force-hooks` to force.'
+            die(msg.format(pathPrePushHook))
+
+    if not force_attrs and not skip_attrs:
+        if not mayOverwrite(GIT_ATTRIBUTES_PATH, gitAttrs):
+            msg = 'Would modify `{}`.  Use `--force-attrs` to force.'
+            die(msg.format(GIT_ATTRIBUTES_PATH))
+
+    try:
+        check_call([
+            'git', 'lfs', 'install', '--force', '--local', '--skip-smudge',
+        ])
+    except CalledProcessError:
+        die('Configuring Git LFS failed.')
+
+    setLfsHooks()
+    skipLfsFetch()
+    if not skip_attrs:
+        writeGitAttributes(gitAttrs)
+        if optTrack == 'convert':
+            log("""Important notice:
+***************************************************************************
+
+To complete the conversion from Git Silo to Git LFS, run the following
+commands:
+
+    rm "$(git rev-parse --git-path 'index')"
+    git add .
+    git commit -a -m 'Convert silo to lfs content'
+
+Then verify with `git status`, `git silo status`, and check that the commit
+modified all placeholders.
+
+***************************************************************************
+""")
+
+    dirty = gitStatus()
+    if dirty:
+        try:
+            gitAdd(GIT_ATTRIBUTES_PATH)
+            gitCommit('lfs: Configure tracking attributes')
+            msg = 'Committed changes in `{}`.'
+            log(msg.format(GIT_ATTRIBUTES_PATH))
+        except CalledProcessError:
+            die('Git operations failed when updating git files')
+
+
+def cmdRemote(args):
+    checkNogEnv()
+    chdir(gitToplevel())
+    optForceConfig = args['--force-config']
+
+    if not optForceConfig and not exists(LFS_CONFIG_PATH):
+        msg = (
+            '`{path}` does not exits, which indicates that this repo has '
+            'never been used with LFS Nog.  Did you mean a subrepo?  '
+            'If you indeed want to initialize this repo for LFS Nog for the '
+            'first time, use --force-config.'
+        ).format(path=LFS_CONFIG_PATH)
+        die(msg)
+
+    dirty = gitStatus()
+    if dirty:
+        die('Uncommitted changes; commit everything before you continue.')
+
+    nogRepo = args['<nog-repo>']
+    if len(nogRepo.split('/')) != 2:
+        die('`<nog-repo>` must be `<owner>/<repo>`.')
+    repoExists = nogRepoExists(nogRepo)
+    repoIsConfigured = nogRepoIsConfigured(nogRepo)
+    force = args['--force']
+    # XXX: Maybe we should attach meta information to the nog repo about the
+    # git repo it belongs to, so that we could easily identify if the repo is a
+    # valid remote.
+    if repoExists and repoIsConfigured:
+        log('Nog repo already configured and created.')
+        return
+
+    if repoExists and not repoIsConfigured and not force:
+        msg = """\
+Nog repo `{0}` already exists.
+Storing LFS content in it would delete its current content.  To overwrite the
+current content and use `{0}` for storing the LFS content, run:
+
+    git-lfs-nog remote -f {0}
+"""
+        die(msg.format(nogRepo))
+
+    if not repoExists:
+        try:
+            createNogRepo(nogRepo)
+        except Exception as err:
+            die('Failed to create Nog repo `{}`: {}'.format(nogRepo, err))
+
+    if not repoIsConfigured:
+        updatedConfig = ensureNogRemoteInConfig(nogRepo)
+        if updatedConfig:
+            try:
+                gitAdd(LFS_CONFIG_PATH)
+                gitCommit('lfs: Configure LFS Nog remote')
+                msg = 'Committed changes in `{}`.'
+                log(msg.format(LFS_CONFIG_PATH))
+            except CalledProcessError:
+                die('Git operations failed when updating git files.')
+
+
+def cmdFetch(args):
+    checkNogEnv()
+    optVerbose = args['--verbose']
+    r = args['<nog-repo>']
+    if r and r != '--':
+        nogRepos = [r]
+    else:
+        nogRepos = readNogRemotesFromConfig()
+
+    # List files in the current directory, but change to the toplevel before
+    # fetching, because `for f in files` produces `Entries` whose `paths` are
+    # relative to the toplevel.
+    files = lsLfs(files=args['<files>'])
+    chdir(gitToplevel())
+    fetchFromNogRepo(nogRepos, files=files, verbose=optVerbose)
+
+
+def fetchFromNogRepo(nogRepos, files, verbose=False):
+    roots = openRepoRoots(nogRepos)
+
+    def fetchOne(e):
+        for r in roots:
+            o = findLfsNogObjectInRoot(e, r)
+            if not o:
+                continue
+            o.copyBlob(e.path)
+            gitAddWithLfs(e.path)
+            return True
+        return False
+
+    nErr = 0
+    for f in files:
+        if f.status == '*':
+            if verbose:
+                log('Up-to-date `{}`.'.format(f.path))
+            continue
+        if not fetchOne(f):
+            logerr('Failed to find Nog content for `{}`.'.format(f.path))
+            nErr += 1
+            continue
+        log('Fetched `{}`.'.format(f.path))
+
+    if nErr > 0:
+        die('There were errors during fetch; see above.')
+
+
+def findLfsNogObjectInRoot(entry, tree):
+    path = entry.path.split('/')
+    initial = path[0:len(path)-1]
+    last = path[-1]
+    for p in initial:
+        tree = next(tree.trees(p), None)
+        if not tree:
+            return None
+    o = next(tree.objects(last), None)
+    if not o:
+        return None
+    if o.meta['lfsid'] != entry.lfsid:
+        return None
+    return o
+
+
+def findLfsNogObjectInRoots(entry, roots):
+    for r in roots:
+        o = findLfsNogObjectInRoot(entry, r)
+        if o:
+            return o
+    return None
+
+
+def openRepoRoots(nogRepos):
+    roots = []
+    for r in nogRepos:
+        try:
+            repo = nog.openRepo(r)
+        except RuntimeError:
+            msg = 'Failed to open Nog repo `{}`; ignoring it.'
+            logwarn(msg.format(r))
+            continue
+        roots.append(repo.getMaster().tree)
+    return roots
+
+
+def createLfsObject(entry, name):
+    o = nog.Object()
+    o.name = name
+    o.meta['lfsid'] = entry.lfsid
+    p = lfsPath(entry.lfsid)
+    if not exists(p):
+        return None
+    o.blob = p
+    return o
+
+
+@attr.s()
+class BuildTreeStats(object):
+    nLfsUpdates = attr.ib(default=0)
+    nLfsTotal = attr.ib(default=0)
+    nText = attr.ib(default=0)
+    nLinks = attr.ib(default=0)
+    nSubmodules = attr.ib(default=0)
+
+
+# `mustBuildLfsOnlyTree()` creates a tree that contains all LFS entries.
+# Entries that are already in Nog in one of the `roots` are preferred.
+# `mustBuildLfsOnlyTree()` reports a fatal error if an entry is neither found
+# in Nog nor locally.
+#
+# This design ensures that a Nog always contains a full tree.  A push fails if
+# it cannot create a full tree.
+def mustBuildLfsOnlyTree(lsLfs, roots):
+    root = nog.Tree()
+    root.name = 'root'
+    root.meta.update({
+        'lfsnogUpload': U_LFS_ONLY,
+    })
+    stats = BuildTreeStats()
+    for e in lsLfs:
+        stats.nLfsTotal += 1
+        o = findLfsNogObjectInRoots(e, roots)
+        if not o:
+            o = createLfsObject(e, basename(e.path))
+            stats.nLfsUpdates += 1
+        if not o:
+            msg = 'Did not find {} neither in remotes nor in local LFS store.'
+            die(msg.format(e))
+        folder = dirname(e.path)
+        if folder:
+            parent = ensurePath(root, folder, leaf='tree')
+        else:
+            parent = root
+        parent.append(o)
+    return root, stats
+
+
+def mustBuildLfsAndTextTree(roots, maxTextSize):
+    root = nog.Tree()
+    root.name = 'root'
+    root.meta.update({
+        'lfsnogUpload': U_LFS_AND_TEXT,
+    })
+    stats = BuildTreeStats()
+
+    lfs = {}
+    for e in lsLfs():
+        lfs[e.path] = e
+
+    def addLfs(ent):
+        stats.nLfsTotal += 1
+        o = findLfsNogObjectInRoots(ent, roots)
+        if not o:
+            o = createLfsObject(ent, basename(ent.path))
+            stats.nLfsUpdates += 1
+        if not o:
+            msg = 'Did not find {} neither in remotes nor in local LFS store.'
+            die(msg.format(ent))
+        folder = dirname(ent.path)
+        if folder:
+            parent = ensurePath(root, folder, leaf='tree')
+        else:
+            parent = root
+        parent.append(o)
+
+    def addText(path):
+        stats.nText += 1
+        o = ensurePath(root, path, leaf='object')
+        txt = readFile(path)
+        if len(txt) > maxTextSize:
+            msg = 'Text file `{}` larger than max text size {}.'
+            die(msg.format(path, maxTextSize))
+        o.text = txt
+
+    def addSymlink(path):
+        stats.nLinks += 1
+        o = ensurePath(root, path, leaf='object')
+        o.text = 'symlink: {}'.format(readlink(path))
+
+    def addSubmodule(path):
+        stats.nSubmodules += 1
+        o = ensurePath(root, path, leaf='object')
+        o.text = 'submodule commit: {}'.format(gitLsSubmoduleCommit(path))
+
+    for p in sorted(gitLsFiles()):
+        ent = lfs.get(p)
+        if ent:
+            try:
+                addLfs(ent)
+            except Exception as err:
+                die('Failed to add LFS content `{}`: {}'.format(p, err))
+        elif islink(p):
+            try:
+                addSymlink(p)
+            except Exception as err:
+                die('Failed to add symlink `{}`: {}'.format(p, err))
+        elif isdir(p):
+            try:
+                addSubmodule(p)
+            except Exception as err:
+                die('Failed to add submodule `{}`: {}'.format(p, err))
+        else:
+            try:
+                addText(p)
+            except Exception as err:
+                die('Failed to add text `{}`: {}'.format(p, err))
+
+    return root, stats
+
+
+def nogRepoExists(repoName):
+    try:
+        nog.openRepo(repoName)
+        return True
+    except RuntimeError:
+        return False
+
+
+def nogRepoIsConfigured(fullName):
+    return fullName in readNogRemotesFromConfig()
+
+
+def createNogRepo(repoName):
+    repo = nog.createRepo(repoName)
+    master = repo.getMaster()
+    root = master.tree
+    master = repo.commitTree(
+        subject='Init repo', tree=root, parent=master.sha1,
+    )
+    msg = r"""Created nog repo `{}`.
+
+You need to manually configure sharing for the new repo in the Nog UI.
+
+"""
+    log(msg.format(repoName))
+
+
+def mustFindUsersRepoName(nogRemotes, name):
+    nogUser = os.environ['NOG_USERNAME']
+    if name is None:
+        matches = [r for r in nogRemotes if r.startswith(nogUser+'/')]
+        if len(matches) == 1:
+            return matches[0]
+        elif len(matches) == 0:
+            msg = """\
+No Nog repo configured.
+
+In order to push LFS content to Nog, you need a Nog repository that is
+configured in `.lfscnogonfig`.  To create one, inspect `.lfsnogconfig` to see
+which repos are already configured.  Then decide how to name your repo, and
+create and configure it with:
+
+    git-lfs-nog remote <nog-repo>
+
+You also need to configure sharing in the Nog UI.
+"""
+            die(msg)
+        else:
+            msg = []
+            msg.append('Multiple nog repos are configured:')
+            for m in matches:
+                msg.append('\t{}'.format(m.split('/')[1]))
+            msg.append('Specify repo:\n\tgit-lfs-nog push <repo-name>')
+            msg.append('Create repo:\n\tgit-lfs-nog remote <repo-name>')
+            die('\n'.join(msg))
+    else:
+        if '/' in name:
+            fullName = name
+        else:
+            fullName = '{}/{}'.format(nogUser, name)
+        if fullName not in nogRemotes:
+            die('Nog repo `{}` is not in config file.'.format(name))
+        return fullName
+
+
+def ensureNogRemoteInConfig(repoName):
+    if nogRepoIsConfigured(repoName):
+        log('Nog repo is already in config file.')
+        return False
+    gitConfigSet('-f', LFS_CONFIG_PATH, '--add', 'nogremote.name', repoName)
+    log('Added `nogremote.name`=`{}` to config file'.format(repoName))
+    return True
+
+
+def cmdPush(args, settings):
+    checkNogEnv()
+    chdir(gitToplevel())
+    optForce = args['--force']
+    repoName = args['<nog-repo>']
+    if repoName == '--':
+        repoName = None
+    gitArgs = args['<git-args>']
+
+    dirty = gitStatus()
+    if dirty:
+        die('Uncommitted changes; commit everything before you push.')
+
+    nogRemotes = readNogRemotesFromConfig()
+    nogRepo = mustFindUsersRepoName(nogRemotes, repoName)
+    try:
+        repo = nog.openRepo(nogRepo)
+    except RuntimeError as err:
+        msg = """\
+Could not open nog repo: {err}
+Does the repo exist?  To create it, run:
+
+    git-lfs-nog remote {0}
+        """
+        die(msg.format(nogRepo, err=err))
+
+    log('Pushing to Nog repo `{}`'.format(nogRepo))
+    gitCommit = gitRevParseHead()
+    master = repo.getMaster()
+    if isEmptyTree(master.tree):
+        log('Proceeding with push to empty Nog repo.')
+    elif canFastForwardNogToGit(master, gitCommit):
+        log('Proceeding with fast-forward push.')
+    elif optForce:
+        log('Proceeding with forced push')
+    else:
+        base = master.meta.get('gitCommit')
+        if base:
+            msg = (
+                'Refusing to push.  Cannot fast-forward Git from the current '
+                'Nog master to the Git HEAD.  You can use -f to override.  '
+                'Nog master.meta: {}'
+            ).format(master.meta)
+        else:
+            msg = (
+                'Refusing to push.  The current Nog commit has no metadata '
+                'to verify that it is a Git fast-forward.  You can use -f '
+                'to override.  Nog master.meta: {}'
+            ).format(master.meta)
+        die(msg)
+
+    roots = openRepoRoots(nogRemotes)
+    if settings.upload == U_AS_BEFORE:
+        upload = master.tree.meta.get('lfsnogUpload', U_LFS_ONLY)
+        if upload not in [U_LFS_ONLY, U_LFS_AND_TEXT]:
+            msg = 'Invalid `meta.lfsnogUpload={}` in Nog repo.'
+            die(msg.format(upload))
+        log('Using `upload={}` as in previous push.'.format(upload))
+    else:
+        upload = settings.upload
+
+    if upload == U_LFS_ONLY:
+        root, stats = mustBuildLfsOnlyTree(lsLfs(), roots=roots)
+    elif upload == U_LFS_AND_TEXT:
+        root, stats = mustBuildLfsAndTextTree(
+            roots=roots, maxTextSize=settings.maxTextSize,
+        )
+    else:
+        raise RuntimeError('Logic error: invalid `upload`.')
+
+    if root.sha1 == master.tree.sha1:
+        log('Already up-to-date.')
+    else:
+        meta = {'gitCommit': gitCommit}
+        master = repo.commitTree(
+            subject='git-lfs-nog push', tree=root, parent=master.sha1,
+            meta=meta,
+        )
+        msg = (
+            'Uploaded {nLfsUpdates} local of {nLfsTotal} total LFS blobs, '
+            '{nText} text objects, '
+            '{nLinks} symlink and {nSubmodules} submodule placeholders.'
+        )
+        log(msg.format(**attr.asdict(stats)))
+
+    if args['--git']:
+        try:
+            log('git push ' + ' '.join(gitArgs))
+            gitPush(*gitArgs)
+        except CalledProcessError as err:
+            die('`git push` to the git repo failed: {}.'.format(err))
+
+
+def isEmptyTree(tree):
+    return next(tree.entries(), None) is None
+
+
+def canFastForwardNogToGit(nogCommit, head):
+    base = nogCommit.meta.get('gitCommit')
+    if not base:
+        return False
+    if not isValidCommitId(base):
+        msg = (
+            'The Git commit that corresponds to the Nog commit '
+            '`meta.gitCommit` is missing.  '
+            'The reason could be that a Git push failed.  '
+            'You should probably locate and fetch the missing Git commit `{}`.'
+        ).format(base)
+        die(msg)
+    return len(gitSplitlines('rev-list', '-n', '1', base, '--not', head)) == 0
+
+
+# See <https://stackoverflow.com/a/31780867/1887896>
+def isValidCommitId(commit):
+    return gitSilent('cat-file', '-e', commit + '^{commit}')
+
+
+# `lsLfs()` uses a filter list from `git ls-files` to limit listing, because
+# `git lfs ls-files` always reports all full tree paths.
+def lsLfs(files=None):
+    files = files or []
+    candidates = gitLsFiles(files)
+    for l in gitSplitlines('lfs', 'ls-files', '--long'):
+        e = Entry(*l.split(" ", 2))
+        if e.path in candidates:
+            yield e
+
+
+def gitLsFiles(files=None):
+    files = files or []
+    return set(gitSplitlines('ls-files', '--full-name', '--', *files))
+
+
+def gitSplitlines(*args):
+    return check_output(['git'] + list(args)).decode('utf-8').splitlines()
+
+
+def gitSilent(*args):
+    returncode = call(['git'] + list(args), stdout=DEVNULL, stderr=DEVNULL)
+    return returncode == 0
+
+
+def gitStatus():
+    return check_output([
+        'git', 'status', '--porcelain'
+    ]).decode('utf-8').strip()
+
+
+def gitDir():
+    return check_output([
+        'git', 'rev-parse', '--git-dir'
+    ]).decode('utf-8').strip()
+
+
+def gitRevParseHead():
+    return check_output([
+        'git', 'rev-parse', '--verify', 'HEAD^{commit}'
+    ]).decode('utf-8').strip()
+
+
+def gitPathPrePushHook():
+    return check_output([
+        'git', 'rev-parse', '--git-path', 'hooks/pre-push',
+    ]).decode('utf-8').strip()
+
+
+def gitLsSubmoduleCommit(path):
+    return check_output([
+        'git', 'ls-tree', 'HEAD', '--', path
+    ]).decode('utf-8').strip().split()[2]
+
+
+def gitAdd(path):
+    check_call([
+        'git', 'add', '--', path,
+    ])
+
+
+def gitAddWithLfs(path):
+    check_call([
+        'git', '-c', 'filter.lfs.clean=git-lfs clean -- %f',
+        'add', '--', path,
+    ])
+
+
+def gitCommit(message):
+    check_call([
+        'git', 'commit', '-m', message,
+    ])
+
+
+def gitPush(*args):
+    check_call(['git', 'push'] + list(args))
+
+
+def gitConfigSet(*args):
+    check_call(['git', 'config'] + list(args))
+
+
+def gitConfigGet(*args):
+    try:
+        return check_output(
+            ['git', 'config'] + list(args)
+        ).decode('utf-8').strip()
+    except CalledProcessError as err:
+        if err.returncode == 1 and err.output == '':
+            return None
+
+def gitConfigKeyExists(p, k):
+    out = gitConfigGet('-f', p, '--get-regexp', k)
+    if out is None:
+        return False
+    return True
+
+def lfsPath(lfsid):
+    return pjoin(gitDir(), 'lfs/objects', lfsid[0:2], lfsid[2:4], lfsid)
+
+
+def readNogRemotesFromConfig():
+    path = pjoin(gitToplevel(), LFS_CONFIG_PATH)
+    cmd = [
+        'git', 'config', '-f', path, '--get-all', 'nogremote.name'
+    ]
+    try:
+        return check_output(cmd).decode('utf-8').strip().split()
+    except CalledProcessError:
+        log('Reading nog remotes: No nog remotes configured')
+    return []
+
+
+def gitToplevel():
+    return check_output([
+        'git', 'rev-parse', '--show-toplevel'
+    ]).decode('utf-8').strip()
+
+
+def gitLfsInstall():
+    check_call([
+        'git', 'lfs', 'install',
+    ])
+
+
+def setLfsHooks():
+    with open(gitPathPrePushHook(), 'w') as f:
+        f.write(LFS_PRE_PUSH_HOOK)
+
+
+def skipLfsFetch():
+    gitConfigSet('filter.lfs.smudge', 'git-lfs smudge --skip -- %f')
+    gitConfigSet('filter.lfs.process', 'git-lfs filter-process --skip')
+    log('Configured working copy to skip automatic Git LFS fetch.')
+
+
+def readFile(file):
+    with open(file, 'rb') as f:
+        content = f.read().decode('utf-8')
+    return content
+
+
+@attr.s()
+class Entry(object):
+    lfsid = attr.ib()
+    status = attr.ib()
+    path = attr.ib()
+
+
+def ensurePath(parent, path, leaf, meta=None):
+    path = path.rstrip('/')
+    (treepath, tail) = os.path.split(path)
+    for t in treepath.split('/'):
+        if not t:
+            break
+        parent = ensureTree(parent, t)
+    if leaf == 'tree':
+        return ensureTree(parent, tail, meta)
+    elif leaf == 'object':
+        return ensureObject(parent, tail, meta)
+    else:
+        raise RuntimeError('Invalid leaf type `{}`.'.format(leaf))
+
+
+def ensureTree(parent, name, meta=None):
+    meta = meta or {}
+    child = next(parent.trees(name), None)
+    if not child:
+        child = nog.Tree()
+        child.name = name
+        child.meta.update(meta)
+        parent.append(child)
+    return child
+
+
+def ensureObject(parent, name, meta=None):
+    meta = meta or {}
+    child = next(parent.objects(name), None)
+    if not child:
+        child = nog.Object()
+        child.name = name
+        child.meta.update(meta)
+        parent.append(child)
+    return child
+
+
+def checkNogEnv():
+    nErrs = 0
+
+    evars = [
+        'NOG_SECRETKEY',
+        'NOG_KEYID',
+        'NOG_API_URL',
+        'NOG_USERNAME',
+        'NOG_CACHE_PATH',
+    ]
+    for v in evars:
+        if v not in os.environ:
+            logerr('Missing environment variable `{}`.'.format(v))
+            nErrs += 1
+
+    if not isdir(os.environ['NOG_CACHE_PATH']):
+        logerr('NOG_CACHE_PATH is not a directory.')
+        nErrs += 1
+
+    if nErrs:
+        die('Invalid Nog environment.')
+
+
+def log(msg):
+    print('lfs-nog:', msg)
+
+
+def logwarn(msg):
+    print('lfs-nog: warning:', msg)
+
+
+def logerr(msg):
+    print('lfs-nog: error:', msg)
+
+
+def die(msg):
+    sys.exit('lfs-nog: fatal: {}'.format(msg))
+
+
+main()

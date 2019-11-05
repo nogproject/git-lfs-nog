@@ -1,0 +1,38 @@
+{
+  "package": {
+    "authors": [
+      {
+        "email": "prohaska@zib.de",
+        "name": "Steffen Prohaska"
+      }
+    ],
+    "content": {
+      "files": [
+        "CHANGELOG.md"
+      ],
+      "objects": [
+        {
+          "text": "CHANGELOG.md"
+        }
+      ]
+    },
+    "description": "Python interface to the nog REST API",
+    "name": "nogpy",
+    "readme": "README.md",
+    "version": {
+      "major": 0,
+      "minor": 0,
+      "patch": 18,
+      "prerelease": "",
+      "sha1": "095b22663dcf67f0ac4cfc9534ac4504509407f6"
+    }
+  },
+  "program": {
+    "code": {
+      "files": [
+        "nog.py"
+      ]
+    }
+  },
+  "programRegistry": "nog/packages"
+}

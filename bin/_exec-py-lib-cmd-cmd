@@ -1,0 +1,64 @@
+#!/bin/bash
+# vim: sw=4 ft=sh
+set -o errexit -o nounset -o pipefail -o noglob
+
+# The exec wrapper may be symlinked.  To locate the lib dir, recursively follow
+# symlinks, which requires GNU coreutils readlink.
+#
+# Python on Windows is not supported.  It would probably require a separate
+# code path.
+
+xreadlink=
+for p in greadlink readlink; do
+    if type ${p} >/dev/null 2>&1 &&
+        ( ${p} --help 2>/dev/null | grep -q 'GNU coreutils' ); then
+        xreadlink="${p}"
+        break
+    fi
+done
+if ! test ${xreadlink}; then
+    echo >&2 'Error: Missing GNU coreutils readlink.'
+    exit 1
+fi
+
+toplevel="$(
+    cd "$(dirname "$(${xreadlink} -f "${BASH_SOURCE[0]}")")" && cd .. && pwd
+)"
+cmd="$(basename "${BASH_SOURCE[0]}")"
+
+# On Linux, prefer a specific virtualenv, like `venv-Ubuntu-xx.xx`.
+localPython3Ubuntu=
+case $(uname -s) in
+Linux)
+    localPython3Ubuntu="${toplevel}/local/venv-$(lsb_release -i -s)-$(lsb_release -r -s)/bin/python3"
+    ;;
+esac
+localPython3="${toplevel}/local/venv/bin/python3"
+
+if [ -n "${ZIBTOOLS_PYTHON3:-}" ]; then
+    python3="${ZIBTOOLS_PYTHON3}"
+elif [ -x "${localPython3Ubuntu}" ]; then
+    python3="${localPython3Ubuntu}"
+elif [ -x "${localPython3}" ]; then
+    python3="${localPython3}"
+else
+    python3='python3'
+    if ! "${python3}" \
+        -c 'import attr; import docopt; import dateutil; import requests';
+    then
+        cat >&2 <<EOF
+Error: \`python3\` failed to import some required modules.
+
+To fix this, either initialize \`local/venv\` as described in
+\`${toplevel}/README.md\`, or
+install the required Python packages for your active \`python3\` environment.
+EOF
+        exit 1
+    fi
+fi
+
+if export | grep 'PYTHONPATH.*2.7'; then
+    echo >&2 'Warning: PYTHONPATH seems to refer to 2.7 libraries (see above), which may cause problems with Python 3.'
+fi
+
+exec "${python3}" "${toplevel}/lib/${cmd}/${cmd}" "$@"
