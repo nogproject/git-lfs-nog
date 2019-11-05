@@ -1,9 +1,7 @@
-[nogremote]
-	name = sprohaska/zibtools
-	name = marcosterland/zibtools
-	name = ulrikehomberg/zibtools
-	name = nlindow/vissys-stdtools-zibtools
-	name = schallau/zibtools
-	name = vincentdercksen/zibtools
-[lfsnog]
-	maxtextsize = 100000
+# RETIRED 2019-11: nog.zib.de has been retired.  The out-commented config
+# illustrates how `git-lfs-nog` would be configured.
+
+#[nogremote]
+#	name = author/zibtools
+#[lfsnog]
+#	maxtextsize = 100000
