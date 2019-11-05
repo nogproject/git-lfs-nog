@@ -1,6 +1,6 @@
 # Git LFS Nog -- README
 By spr
-@@VERSIONINC@@
+<!--@@VERSIONINC@@-->
 
 # Introduction
 
